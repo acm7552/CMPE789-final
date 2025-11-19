@@ -1,17 +1,20 @@
 import numpy as np
 import torch
 import torch.nn as nn
-#from torchsummary import summary
+from torchsummary import summary
 from torchvision import transforms, io
 from torch.utils.data import Dataset, DataLoader
 #from PIL import Image
 import os
 #import pandas as pd
-#import imageio
+import imageio.v2 as imageio
 import argparse
-#import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 
 
+
+H = 480
+W = 640
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -25,7 +28,22 @@ def load_images():
     seg_list   = os.listdir(seg_path)
     image_list = [image_path+i for i in image_list]
     seg_list = [seg_path+i for i in seg_list]
-    return image_list, seg_list
+
+    N = 2
+    img = imageio.imread(image_list[N])
+    mask = imageio.imread(seg_list[N])
+
+    fig, arr = plt.subplots(1, 2, figsize=(14, 10))
+    arr[0].imshow(img)
+    arr[0].set_title('Image')
+    arr[1].imshow(mask[:, :, 0])
+    arr[1].set_title('Segmentation')
+    plt.show()
+    os.makedirs("plots", exist_ok=True)
+    fig.savefig(f"plots/image_{N}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    return
 
 
 class Segmentation_Dataset(Dataset):
@@ -53,6 +71,39 @@ class Segmentation_Dataset(Dataset):
     # need these functions for pytorch dataset
     def __len__(self):
         return len(self.images)
+    
+    
+
+    # def __getitem__(self, index):
+
+    #     img_name = self.images[index]
+
+    #     # load rgb
+    #     img_file = os.path.join(self.img_path, img_name)
+    #      # c x h x w
+    #     img = io.read_image(img_file)
+
+    #     # resize + tensor
+    #     img = self.image_transforms(img)               
+
+    #     # load the mask
+    #     seg_file = os.path.join(self.seg_path, img_name)
+    #     # take the single channel
+    #     mask = io.read_image(seg_file)[0]              
+
+    #     # mask is uint8 integer class
+    #     # resize it with nearest so class IDs dont get interpolated
+    #     mask = transforms.functional.resize(
+    #         mask.unsqueeze(0),
+    #         (self.h, self.w),
+    #         interpolation=transforms.InterpolationMode.NEAREST
+    #     ).squeeze(0)
+
+    #     # ensure integer dtype for CrossEntropyLoss
+    #     mask = mask.long()
+
+    #     return {"IMAGE": img, "MASK": mask}
+    
 
     def __getitem__(self, index):
         img_name = self.images[index]
@@ -66,8 +117,11 @@ class Segmentation_Dataset(Dataset):
 
         # this collapses rgb channels into a single dimension mask 
         mask, _ = torch.max(mask[0:3], dim=0, keepdim=True)
-
+        #mask = io.read_image(seg_file)[0]  # single channel
+        mask = mask.to(torch.long)
+        #print(mask.shape)
         img, mask = self.image_transforms(img), self.mask_transforms(mask)
+        # print(f"[IDX {index}] mask max pixel value: {mask.max().item()}")
         return {"IMAGE": img, "MASK": mask}
     
 
@@ -86,7 +140,7 @@ class convStack(nn.Module):
         self.bn2 = nn.BatchNorm2d(n_filters) # here too
         self.activation = nn.ReLU()
         self.maxpool = maxpool
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) if self.max_pooling else None
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) if self.maxpool else None
         self.p_dropout = p_dropout
         self.dropout = nn.Dropout(p=p_dropout)
         self.batchNorm = batchNorm
@@ -165,7 +219,7 @@ class decoderBlock(nn.Module):
 # the number of filters increases alot towards the middle of the network
 # 
 class CARLA_UNet(nn.Module):
-    def __init__(self, in_channels=3, n_filters=32, n_classes=23, batchNorm=False):
+    def __init__(self, in_channels=3, n_filters=8, n_classes=28, batchNorm=False):
      
         # notice dropout is usually done in the denser middle part where we have lots of filters and low level features
         # not a good idea to do it in other places or in upsampling
@@ -175,7 +229,7 @@ class CARLA_UNet(nn.Module):
         self.conv_layer_3 = convStack(n_filters*2,  n_filters*4, batchNorm=batchNorm)
         self.conv_layer_4 = convStack(n_filters*4, n_filters*8, p_dropout=0.3, batchNorm=batchNorm)
         # final encoder block doesnt maxpool again because now we're going back up in resolution
-        self.conv_layer_5 = convStack(n_filters*8, n_filters*16, p_dropout=0.3, max_pooling=False, batchNorm=batchNorm)
+        self.conv_layer_5 = convStack(n_filters*8, n_filters*16, p_dropout=0.3, maxpool=False, batchNorm=batchNorm)
 
         self.upsample_1 = decoderBlock(n_filters*16, n_filters*8, n_filters * 8, batchNorm=batchNorm)
         self.upsample_2 = decoderBlock(n_filters*8, n_filters*4, n_filters * 4, batchNorm=batchNorm)
@@ -205,13 +259,13 @@ class CARLA_UNet(nn.Module):
         
 
         # combine the output with the previous skip corresponding to the right resolution
-        out = self.upsample_layer_1(conv_5_next, conv_4_skip)
+        out = self.upsample_1(conv_5_next, conv_4_skip)
         # and again
-        out = self.upsample_layer_2(out, conv_3_skip)
+        out = self.upsample_2(out, conv_3_skip)
         # and again
-        out = self.upsample_layer_3(out, conv_2_skip)
+        out = self.upsample_3(out, conv_2_skip)
         # and again
-        out = self.upsample_layer_4(out, conv_1_skip)
+        out = self.upsample_4(out, conv_1_skip)
         # and one final convolution for good measure
         out = self.last_conv(out)
         return out
@@ -233,22 +287,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batchSize", type=int, default=32)
+    parser.add_argument("--batchSize", type=int, default=16)
     parser.add_argument("--b1", type=float, default=0.9, help="Adam beta1") # im probably not gonna mess with these
     parser.add_argument("--b2", type=float, default=0.999, help="Adam beta2") # this neither
 
     args = parser.parse_args()
 
     # get paths for rbg images and segmentation masks
-    path = '/output/'
-    image_path = os.path.join(path, './rgb/')
-    seg_path   = os.path.join(path, './seg/')
+    path = 'output'
+    image_path = os.path.join(path, 'rgb')
+    #print(image_path)
+    seg_path   = os.path.join(path, 'seg_raw')
 
+    # load_images()
     # set up the dataloader
-    dataloader = DataLoader(Segmentation_Dataset(image_path, seg_path), batch_size=args.batchSize, shuffle=True)
+    dataloader = DataLoader(Segmentation_Dataset(image_path, seg_path, H, W), batch_size=args.batchSize, shuffle=True)
 
+    print(len(dataloader))
     # now set up the model
     unet = CARLA_UNet().to(device)
+    print(summary(unet, (3, H, W)))
     criterion = nn.CrossEntropyLoss()
     # adam optimizer
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr, betas=(args.b1, args.b2))
@@ -269,9 +327,10 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             
             outputs = unet(images)
-
+            # print(outputs)
             # compute loss
             loss = criterion(outputs, masks)
+            
             epoch_losses.append(loss.item() * images.size(0))
 
             # backprop

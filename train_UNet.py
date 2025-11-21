@@ -219,7 +219,7 @@ class decoderBlock(nn.Module):
 # the number of filters increases alot towards the middle of the network
 # 
 class CARLA_UNet(nn.Module):
-    def __init__(self, in_channels=3, n_filters=8, n_classes=28, batchNorm=False):
+    def __init__(self, in_channels=3, n_filters=16, n_classes=28, batchNorm=False):
      
         # notice dropout is usually done in the denser middle part where we have lots of filters and low level features
         # not a good idea to do it in other places or in upsampling
@@ -285,9 +285,9 @@ class CARLA_UNet(nn.Module):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batchSize", type=int, default=16)
+    parser.add_argument("--batchSize", type=int, default=8)
     parser.add_argument("--b1", type=float, default=0.9, help="Adam beta1") # im probably not gonna mess with these
     parser.add_argument("--b2", type=float, default=0.999, help="Adam beta2") # this neither
 
@@ -300,10 +300,22 @@ if __name__ == "__main__":
     seg_path   = os.path.join(path, 'seg_raw')
 
     # load_images()
-    # set up the dataloader
-    dataloader = DataLoader(Segmentation_Dataset(image_path, seg_path, H, W), batch_size=args.batchSize, shuffle=True)
+    # set up the dataloaders
+    dataset = Segmentation_Dataset(image_path, seg_path, H, W)
+     # 20% validation
+    val_ratio = 0.2  
+    n_total = len(dataset)
+    n_val   = int(n_total * val_ratio)
+    n_train = n_total - n_val
 
-    print(len(dataloader))
+    train_set, val_set = torch.utils.data.random_split(
+        dataset, 
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)  # reproducible
+    )
+    train_loader = DataLoader(train_set, batch_size=args.batchSize, shuffle=True)
+    val_loader   = DataLoader(val_set, batch_size=args.batchSize, shuffle=False)
+    # print(len(dataloader))
     # now set up the model
     unet = CARLA_UNet().to(device)
     print(summary(unet, (3, H, W)))
@@ -311,13 +323,21 @@ if __name__ == "__main__":
     # adam optimizer
     optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr, betas=(args.b1, args.b2))
 
-
+    # step scheduler decreases learning rate every 5 epochs
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=10,   
+        gamma=0.75       
+    )
+    
     # training loop
-
-    losses = []
+    os.makedirs("unet", exist_ok=True)
+    train_losses = []
+    val_losses = []
     for epoch in range(args.epochs):
-        epoch_losses = []
-        for i, batch in enumerate(dataloader):
+        epoch_losses = 0
+        unet.train()
+        for i, batch in enumerate(train_loader):
             images = batch['IMAGE'].to(device)
             masks = batch['MASK'].to(device)
 
@@ -331,20 +351,41 @@ if __name__ == "__main__":
             # compute loss
             loss = criterion(outputs, masks)
             
-            epoch_losses.append(loss.item() * images.size(0))
+            epoch_losses += loss.item() * images.size(0)
 
             # backprop
             loss.backward()
             optimizer.step()
 
 
-            # print how many samples its gone thru
-            currSamples = min((i + 1) * args.batchSize, len(dataloader.dataset))
-            print(f'EPOCH {epoch} ({currSamples}/{len(dataloader.dataset)})  \t Loss:{loss.item()}')
-        losses.append(np.mean(epoch_losses) / len(dataloader.dataset))
+            ## print how many samples its gone thru
+            currSamples = min((i + 1) * args.batchSize, len(train_loader.dataset))
+            print(f'EPOCH {epoch} ({currSamples}/{len(train_loader.dataset)})  \t Loss:{loss.item()}')
+        # do some validation    
+        train_loss = (epoch_losses) / len(train_loader.dataset)
+        unet.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch['IMAGE'].to(device)
+                masks = batch['MASK'].to(device)
+                N, C, H, W = masks.shape
+                masks = masks.reshape((N, H, W)).long()
 
+                outputs = unet(images)
+                loss = criterion(outputs, masks)
+
+                val_loss += loss.item() * images.size(0)
+
+        val_loss /= len(val_loader.dataset)
+        print(f"EPOCH {epoch}  Train Loss: {train_loss:.4f}  |  Val Loss: {val_loss:.4f}")
+                
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        scheduler.step()
         # save state dict after every epoch in case of crashes
-        torch.save(unet.state_dict(), f"unet_{epoch}.pth")
+        torch.save(unet.state_dict(), f"unet/unet_{epoch}.pth")
+    
 
 
 

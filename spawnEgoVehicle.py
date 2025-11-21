@@ -25,7 +25,7 @@ SPEED = 20.0  # km/h
 
 
 CAPTURE_INTERVAL = 0.1  # seconds between frames 
-DURATION = 90  # seconds capturing
+DURATION = 180  # seconds capturing
 OUTPUT_DIR = "output"
 
 # setup output folders
@@ -40,7 +40,7 @@ for d in [rgb_dir, seg_dir, seg_raw_dir, depth_dir]:
 
 
 client = carla.Client(HOST, PORT)
-client.set_timeout(60.0)
+client.set_timeout(120.0)
 world = client.get_world()
 
 settings = world.get_settings()

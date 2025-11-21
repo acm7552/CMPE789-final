@@ -19,7 +19,7 @@ Setting up vehicles and pedestrians
 
 ```python generate_traffic.py -n 50 -w 15```
 
-```D:\CARLA_0.9.15\WindowsNoEditor\CMPE789-final``
+```cd D:\CARLA_0.9.15\WindowsNoEditor\CMPE789-final``
 
 ```python spawnEgoVehicle.py```
 

@@ -1,7 +1,9 @@
-/output/
+*output*
+*output*/
 /unet/
 
 *.pth
+
 
 #### everything below is the default Github python gitignore
 

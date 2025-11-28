@@ -4,7 +4,7 @@ import torch.nn as nn
 from torchsummary import summary
 from torchvision import transforms, io
 from torch.utils.data import Dataset, DataLoader
-#from PIL import Image
+from PIL import Image
 import os
 #import pandas as pd
 import imageio.v2 as imageio
@@ -12,40 +12,38 @@ import argparse
 import matplotlib.pyplot as plt
 
 
+
+
 H = 480
 W = 640
 
+MAX_DEPTH_METERS = 300.0
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# def load_images():
-#     # get manually collected data
-#     path = '/output/'
-#     image_path = os.path.join(path, './rgb/')
-#     seg_path   = os.path.join(path, './seg/')
-#     image_list = os.listdir(image_path)
-#     seg_list   = os.listdir(seg_path)
-#     image_list = [image_path+i for i in image_list]
-#     seg_list = [seg_path+i for i in seg_list]
 
-#     N = 2
-#     img = imageio.imread(image_list[N])
-#     mask = imageio.imread(seg_list[N])
 
-#     fig, arr = plt.subplots(1, 2, figsize=(14, 10))
-#     arr[0].imshow(img)
-#     arr[0].set_title('Image')
-#     arr[1].imshow(mask[:, :, 0])
-#     arr[1].set_title('Segmentation')
-#     plt.show()
-#     os.makedirs("plots", exist_ok=True)
-#     fig.savefig(f"plots/image_{N}.png", dpi=300, bbox_inches="tight")
-#     plt.close(fig)
+def decodeCarlaDepth(path):
+    # helpder function to
 
-#     return
+    # have to decode png into int8
+    raw = io.read_image(path)  
+    raw = raw.permute(1,2,0).numpy().astype(np.float32) 
+
+    R = raw[:,:,0]
+    G = raw[:,:,1]
+    B = raw[:,:,2]
+
+    normalized = (R + 256*G + 65536*B) / (256**3 - 1)
+
+    depth_m = normalized * 1000.0
+    # should be shape (H, W)
+    return depth_m 
+
 
 
 # this version reads for multiple vehicles
-class MultiAgentSegDataset(Dataset):
+class MultiAgentDepthDataset(Dataset):
     def __init__(self, root_dir, h, w):
 
         self.h = h
@@ -59,24 +57,24 @@ class MultiAgentSegDataset(Dataset):
 
         for agent_path in agent_dirs:
             rgb_path = os.path.join(agent_path, "rgb")
-            seg_path = os.path.join(agent_path, "seg_raw")
+            depth_path = os.path.join(agent_path, "depth_raw")
 
-            if not (os.path.isdir(rgb_path) and os.path.isdir(seg_path)):
-                print(f"[WARN] Missing rgb/seg in {agent_path}, skipping")
+            if not (os.path.isdir(rgb_path) and os.path.isdir(depth_path)):
+                print(f"[WARN] Missing rgb/depth in {agent_path}, skipping")
                 continue
 
             rgb_files = sorted(os.listdir(rgb_path))
 
             for f in rgb_files:
                 rgb_file = os.path.join(rgb_path, f)
-                seg_file = os.path.join(seg_path, f)
+                depth_file = os.path.join(depth_path, f)
 
-                if os.path.exists(seg_file):
-                    self.samples.append((rgb_file, seg_file))
+                if os.path.exists(depth_file):
+                    self.samples.append((rgb_file, depth_file))
                 else:
                     print(f"[WARN] Missing mask for {rgb_file}, skipping")
 
-        print(f"[INFO] Loaded {len(self.samples)} (rgb, seg) pairs from {len(agent_dirs)} agents.")
+        print(f"[INFO] Loaded {len(self.samples)} (rgb, depth) pairs from {len(agent_dirs)} agents.")
 
         # transforms
         self.image_transforms = transforms.Compose([
@@ -94,24 +92,21 @@ class MultiAgentSegDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
-        rgb_file, seg_file = self.samples[index]
+        rgb_file, depth_file = self.samples[index]
 
-        # load image
+        # rgb loading
         img = io.read_file(rgb_file)
         img = io.decode_png(img)
-
-        # load  mask 
-        mask = io.read_image(seg_file)
-        
-        # converts to 1 channel 
-        mask, _ = torch.max(mask[0:3], dim=0, keepdim=True)
-        mask = mask.long()
-
-        # apply transforms
         img = self.image_transforms(img)
-        mask = self.mask_transforms(mask)
-        # print(f"[IDX {index}] mask max pixel value: {mask.max().item()}")
-        return {"IMAGE": img, "MASK": mask}
+
+        # depth loading
+        # (H,W)
+        depth_m = decodeCarlaDepth(depth_file)  
+        # new shape should be (1,H,W)
+        depth_m = torch.from_numpy(depth_m).unsqueeze(0)  
+        depth_m = self.mask_transforms(depth_m)  
+        # resized
+        return {"IMAGE": img, "DEPTH": depth_m}
     
 
 # U-net encoder consists of several convolutional blocks that typically have the same layout:
@@ -229,7 +224,9 @@ class CARLA_UNet(nn.Module):
         self.last_conv = nn.Sequential(
             nn.Conv2d(n_filters, n_filters,  kernel_size=(3, 3), padding=1),
             nn.ReLU(),
-            nn.Conv2d(n_filters, n_classes,  kernel_size=(1, 1), padding=0),
+            #nn.Conv2d(n_filters, n_classes,  kernel_size=(1, 1), padding=0),
+            # this outputs a single depth channel
+            nn.Conv2d(n_filters, 1, kernel_size=1) 
         )
 
     def forward(self, x):
@@ -260,6 +257,29 @@ class CARLA_UNet(nn.Module):
         return out
         
 
+def depth_metrics(pred, target):
+
+    # returns dictionary of metrics
+    eps = 1e-6
+    pred = pred.clamp(min=eps)
+    target = target.clamp(min=eps)
+
+    diff = pred - target
+    # mae,
+    mae = diff.abs().mean().item()
+    # rmse, 
+    rmse = torch.sqrt((diff ** 2).mean()).item()
+
+    # absrel, 
+    absrel = (diff.abs() / target).mean().item()
+
+    # delta1/2/3 (averaged per batch)
+    ratio = torch.max(pred / target, target / pred)
+    delta1 = (ratio < 1.25).float().mean().item()
+    delta2 = (ratio < 1.25 ** 2).float().mean().item()
+    delta3 = (ratio < 1.25 ** 3).float().mean().item()
+
+    return {"mae": mae, "rmse": rmse, "absrel": absrel, "delta1": delta1, "delta2": delta2, "delta3": delta3}
 
 # som hyperparams
 
@@ -269,12 +289,14 @@ class CARLA_UNet(nn.Module):
 # B1 = 0.9
 # B2 = 0.999
 
+
+
 # main training function
 
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("path", help="folder containing the multiple agent data")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batchSize", type=int, default=8)
@@ -283,11 +305,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # get paths for rbg images and segmentation masks
     #path = 'output'
     #image_path = os.path.join(args.path, 'rgb')
     #print(image_path)
-    #seg_path   = os.path.join(path, 'seg_raw')
+ 
 
     # load_images()
     # set up the dataloaders
@@ -295,24 +316,24 @@ if __name__ == "__main__":
     root_dir = "output"   # we are doing multi now!!
     #root = "output"
 
-    count = 0
+    # count = 0
 
-    for path, dirs, files in os.walk(root_dir):
-        for f in files:
-            if f.lower().endswith(".png"):
-                full = os.path.join(path, f)
-                count += 1
+    # for path, dirs, files in os.walk(root_dir):
+    #     for f in files:
+    #         if f.lower().endswith(".png"):
+    #             full = os.path.join(path, f)
+    #             count += 1
 
-                # progress log every 250 images
-                if count % 250 == 0:
-                    print(f"Checked {count} PNG files so far...")
+    #             # progress log every 250 images
+    #             if count % 250 == 0:
+    #                 print(f"Checked {count} PNG files so far...")
 
-                try:
-                    io.decode_png(io.read_file(full))
-                except Exception as e:
-                    print("CORRUPTED:", full, e)
+    #             try:
+    #                 io.decode_png(io.read_file(full))
+    #             except Exception as e:
+    #                 print("CORRUPTED:", full, e)
 
-    dataset = MultiAgentSegDataset(root_dir, H, W)
+    dataset = MultiAgentDepthDataset(root_dir, H, W)
     # 20% validation
     val_ratio = 0.2  
     n_total = len(dataset)
@@ -328,11 +349,13 @@ if __name__ == "__main__":
     val_loader   = DataLoader(val_set, batch_size=args.batchSize, shuffle=False)
     # print(len(dataloader))
     # now set up the model
-    unet = CARLA_UNet().to(device)
-    print(summary(unet, (3, H, W)))
-    criterion = nn.CrossEntropyLoss()
+    #unet = CARLA_UNet().to(device)
+    depth_unet = CARLA_UNet(in_channels=3, n_filters=16, n_classes=1).to(device)
+    print(summary(depth_unet, (3, H, W)))
+    #criterion = nn.CrossEntropyLoss()
+    criterion = nn.L1Loss()
     # adam optimizer
-    optimizer = torch.optim.Adam(unet.parameters(), lr=args.lr, betas=(args.b1, args.b2))
+    optimizer = torch.optim.Adam(depth_unet.parameters(), lr=args.lr, betas=(args.b1, args.b2))
 
     # step scheduler decreases learning rate every 5 epochs
     scheduler = torch.optim.lr_scheduler.StepLR(
@@ -342,60 +365,165 @@ if __name__ == "__main__":
     )
     
     # training loop
-    os.makedirs("unet", exist_ok=True)
+    os.makedirs("unet_depth", exist_ok=True)
+    os.makedirs("depth_plots", exist_ok=True)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
     train_losses = []
     val_losses = []
-    for epoch in range(args.epochs):
-        epoch_losses = 0
-        unet.train()
-        for i, batch in enumerate(train_loader):
-            images = batch['IMAGE'].to(device)
-            masks = batch['MASK'].to(device)
 
-            N, C, H, W = masks.shape
-            masks = masks.reshape((N, H, W)).long()
+    save_counter = 0
+
+    best_val_rmse = float('inf')
+
+    for epoch in range(args.epochs):
+        depth_unet.train()
+        running_loss = 0.0
+
+        for i, batch in enumerate(train_loader):
+            images = batch["IMAGE"].to(device, non_blocking=True)
+            depths = batch["DEPTH"].to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            
-            outputs = unet(images)
-            # print(outputs)
-            # compute loss
-            loss = criterion(outputs, masks)
-            
-            epoch_losses += loss.item() * images.size(0)
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                outputs =  depth_unet(images)  # (B,1,H,W)
+                # outputs may be arbitrary scale — since target is meters we train directly in meters
+                loss = criterion(outputs, depths)
 
-            # backprop
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
+            running_loss += loss.item() * images.size(0)
 
-            ## print how many samples its gone thru
-            currSamples = min((i + 1) * args.batchSize, len(train_loader.dataset))
-            print(f'EPOCH {epoch} ({currSamples}/{len(train_loader.dataset)})  \t Loss:{loss.item()}')
-        # do some validation    
-        train_loss = (epoch_losses) / len(train_loader.dataset)
-        unet.eval()
+            # logging
+            if (i + 1) % 10 == 0:
+                print(f"[Epoch {epoch+1}/{args.epochs}] Iter {i+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
+
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+
+        # validation
+
+        depth_unet.eval()
         val_loss = 0
+
+        metrics_acc = {"mae": 0.0, "rmse": 0.0, "absrel": 0.0, "delta1": 0.0, "delta2": 0.0, "delta3": 0.0}
+        batches = 0
+
         with torch.no_grad():
             for batch in val_loader:
-                images = batch['IMAGE'].to(device)
-                masks = batch['MASK'].to(device)
-                N, C, H, W = masks.shape
-                masks = masks.reshape((N, H, W)).long()
+                images = batch["IMAGE"].to(device, non_blocking=True)
+                depths = batch["DEPTH"].to(device, non_blocking=True)
 
-                outputs = unet(images)
-                loss = criterion(outputs, masks)
+                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                    outputs = depth_unet(images)
 
-                val_loss += loss.item() * images.size(0)
+                loss = criterion(outputs, depths)
+                val_running_loss += loss.item() * images.size(0)
 
-        val_loss /= len(val_loader.dataset)
-        print(f"EPOCH {epoch}  Train Loss: {train_loss:.4f}  |  Val Loss: {val_loss:.4f}")
-                
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+                # collect metrics
+                m = depth_metrics(outputs, depths)
+                for k in metrics_acc:
+                    metrics_acc[k] += m[k]
+                batches += 1
+
+               
+            # average metrics
+            val_loss = val_running_loss / len(val_loader.dataset)
+            val_losses.append(val_loss)
+            for k in metrics_acc:
+                metrics_acc[k] /= max(1, batches)
+
+            print(f"=== Epoch {epoch+1}/{args.epochs} summary ===")
+            print(f" Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            print(f" MAE: {metrics_acc['mae']:.4f} m | RMSE: {metrics_acc['rmse']:.4f} m | AbsRel: {metrics_acc['absrel']:.4f}")
+            print(f" delta1: {metrics_acc['delta1']:.4f} | delta2: {metrics_acc['delta2']:.4f} | delta3: {metrics_acc['delta3']:.4f}")
+
+            # save model checkpoint
+            torch.save(depth_unet.state_dict(), f"unet_depth/unet_depth_epoch_{epoch:03d}.pth")
+            print(f"[Saved] 'unet_depth/unet_depth_epoch_{epoch:03d}.pth'")
+
+            # optionally save best by RMSE
+            if metrics_acc["rmse"] < best_val_rmse:
+                best_val_rmse = metrics_acc["rmse"]
+                torch.save(depth_unet.state_dict(), "unet_depth/unet_depth_best.pth")
+                print("[Saved] best model checkpoint.")
+
         scheduler.step()
-        # save state dict after every epoch in case of crashes
-        torch.save(unet.state_dict(), f"unet/unet_{epoch}.pth")
+
+    # done training, get some plots and visualizations
+
+    print("Training finished.")
+
+    print("Generating depth validation visualizations...")
+
+    vis_dir = "depth_plots/val_predictions"
+    os.makedirs(vis_dir, exist_ok=True)
+
+    depth_unet.eval()
+    with torch.no_grad():
+        for idx, batch in enumerate(val_loader):
+
+            images = batch["IMAGE"].to(device)
+            depths = batch["DEPTH"].to(device)
+
+            # forward pass
+            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                preds = depth_unet(images)
+
+            # detach to cpu
+            images_np = images.cpu().permute(0,2,3,1).numpy()            # (B,H,W,3)
+            gt_np     = depths.cpu().squeeze(1).numpy()                  # (B,H,W)
+            pred_np   = preds.cpu().squeeze(1).numpy()                   # (B,H,W)
+
+            B = images_np.shape[0]
+
+            for i in range(B):
+                rgb     = images_np[i]              # float in [0,1]
+                gt_d    = gt_np[i]                  # meters
+                pred_d  = pred_np[i]                # meters
+
+                # normalize depth maps for visualization
+                vmax = MAX_DEPTH_METERS
+                gt_viz   = np.clip(gt_d / vmax, 0, 1)
+                pred_viz = np.clip(pred_d / vmax, 0, 1)
+
+                # create fig
+                fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+
+                ax[0].imshow(rgb)
+                ax[0].set_title("RGB")
+                ax[0].axis("off")
+
+                ax[1].imshow(gt_viz, cmap="magma")
+                ax[1].set_title("Ground Truth Depth")
+                ax[1].axis("off")
+
+                ax[2].imshow(pred_viz, cmap="magma")
+                ax[2].set_title("Predicted Depth")
+                ax[2].axis("off")
+
+                fig.tight_layout()
+                fig.savefig(os.path.join(vis_dir, f"val_{idx:04d}_{i:02d}.png"), dpi=200)
+                plt.close(fig)
+
+    print(f"Saved visualization images to: {vis_dir}")
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("L1 Loss (meters)")
+    plt.title("Depth training loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("depth_plots/loss_curve.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"saved in depth_plots/loss_curve.png'")
+
+    
     
 
 

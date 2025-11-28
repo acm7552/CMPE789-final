@@ -1,8 +1,10 @@
 *output*
 *output*/
 /unet/
+/*plots*/
 
 *.pth
+*.zip
 
 
 #### everything below is the default Github python gitignore

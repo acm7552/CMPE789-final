@@ -1,3 +1,6 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,7 +8,7 @@ from torchsummary import summary
 from torchvision import transforms, io
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-import os
+
 #import pandas as pd
 import imageio.v2 as imageio
 import argparse
@@ -24,7 +27,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def decodeCarlaDepth(path):
-    # helpder function to
+    # helpder function to decode
 
     # have to decode png into int8
     raw = io.read_image(path)  
@@ -34,10 +37,15 @@ def decodeCarlaDepth(path):
     G = raw[:,:,1]
     B = raw[:,:,2]
 
-    normalized = (R + 256*G + 65536*B) / (256**3 - 1)
+    normalized = (R + 256.0 *G + 65536.0 *B) / (256**3 - 1)
 
     depth_m = normalized * 1000.0
     # should be shape (H, W)
+
+    # this clamps in case we did some weird nan thing
+    depth_m = np.nan_to_num(depth_m, nan=0.0, posinf=MAX_DEPTH_METERS, neginf=0.0)
+    depth_m = np.clip(depth_m, 0.0, MAX_DEPTH_METERS)
+
     return depth_m 
 
 
@@ -255,6 +263,26 @@ class CARLA_UNet(nn.Module):
         # and one final convolution for good measure
         out = self.last_conv(out)
         return out
+    
+
+# combines L1 and L2
+class BerHuLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target):
+        diff = torch.abs(target - pred)
+        c = 0.2 * diff.max()
+
+        # L1 
+        l1_part = diff[diff <= c]
+
+        # L2 
+        l2_part = diff[diff > c]
+        l2_part = (l2_part**2 + c**2) / (2*c)
+
+        loss = torch.cat([l1_part, l2_part], dim=0).mean()
+        return loss
         
 
 def depth_metrics(pred, target):
@@ -296,10 +324,10 @@ def depth_metrics(pred, target):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("path", help="folder containing the multiple agent data")
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batchSize", type=int, default=8)
+    parser.add_argument("--batchSize", type=int, default=16)
     parser.add_argument("--b1", type=float, default=0.9, help="Adam beta1") # im probably not gonna mess with these
     parser.add_argument("--b2", type=float, default=0.999, help="Adam beta2") # this neither
 
@@ -354,6 +382,7 @@ if __name__ == "__main__":
     print(summary(depth_unet, (3, H, W)))
     #criterion = nn.CrossEntropyLoss()
     criterion = nn.L1Loss()
+    #criterion = BerHuLoss()
     # adam optimizer
     optimizer = torch.optim.Adam(depth_unet.parameters(), lr=args.lr, betas=(args.b1, args.b2))
 
@@ -368,7 +397,8 @@ if __name__ == "__main__":
     os.makedirs("unet_depth", exist_ok=True)
     os.makedirs("depth_plots", exist_ok=True)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    #USE_AMP = False  # set False to temporarily disable mixed precision for debugging
+    #scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and USE_AMP))
 
     train_losses = []
     val_losses = []
@@ -386,20 +416,31 @@ if __name__ == "__main__":
             depths = batch["DEPTH"].to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                outputs =  depth_unet(images)  # (B,1,H,W)
-                # outputs may be arbitrary scale — since target is meters we train directly in meters
-                loss = criterion(outputs, depths)
+            #with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            
+            
+            outputs =  depth_unet(images)  # (B,1,H,W)
+            outputs = torch.clamp(outputs, 0.0, MAX_DEPTH_METERS)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss = criterion(outputs, depths)
+            
+            #scaler.scale(loss).backward()
+            #scaler.step(optimizer)
+            #scaler.update()
 
+
+            
             running_loss += loss.item() * images.size(0)
 
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(depth_unet.parameters(), max_norm=1.0)
+            #torch.nn.utils.clip_grad_value_(depth_unet.parameters(), clip_value=1.0)
+            optimizer.step()
             # logging
-            if (i + 1) % 10 == 0:
-                print(f"[Epoch {epoch+1}/{args.epochs}] Iter {i+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
+            # print how many samples its gone thru
+            currSamples = min((i + 1) * args.batchSize, len(train_loader.dataset))
+            print(f'EPOCH {epoch} ({currSamples}/{len(train_loader.dataset)})  \t Loss:{loss.item()}')
 
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -411,14 +452,20 @@ if __name__ == "__main__":
 
         metrics_acc = {"mae": 0.0, "rmse": 0.0, "absrel": 0.0, "delta1": 0.0, "delta2": 0.0, "delta3": 0.0}
         batches = 0
-
+        val_running_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 images = batch["IMAGE"].to(device, non_blocking=True)
                 depths = batch["DEPTH"].to(device, non_blocking=True)
 
-                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    outputs = depth_unet(images)
+                #with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+                #    outputs = depth_unet(images)
+
+                # optimizer.zero_grad()
+                
+                outputs = depth_unet(images)
+
+                outputs = torch.clamp(outputs, 0.0, MAX_DEPTH_METERS)
 
                 loss = criterion(outputs, depths)
                 val_running_loss += loss.item() * images.size(0)
@@ -436,20 +483,19 @@ if __name__ == "__main__":
             for k in metrics_acc:
                 metrics_acc[k] /= max(1, batches)
 
-            print(f"=== Epoch {epoch+1}/{args.epochs} summary ===")
-            print(f" Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+            print(f"Epoch {epoch}/{args.epochs}: Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
             print(f" MAE: {metrics_acc['mae']:.4f} m | RMSE: {metrics_acc['rmse']:.4f} m | AbsRel: {metrics_acc['absrel']:.4f}")
             print(f" delta1: {metrics_acc['delta1']:.4f} | delta2: {metrics_acc['delta2']:.4f} | delta3: {metrics_acc['delta3']:.4f}")
 
             # save model checkpoint
             torch.save(depth_unet.state_dict(), f"unet_depth/unet_depth_epoch_{epoch:03d}.pth")
-            print(f"[Saved] 'unet_depth/unet_depth_epoch_{epoch:03d}.pth'")
+            print(f"Saved 'unet_depth/unet_depth_epoch_{epoch:03d}.pth'")
 
             # optionally save best by RMSE
             if metrics_acc["rmse"] < best_val_rmse:
                 best_val_rmse = metrics_acc["rmse"]
                 torch.save(depth_unet.state_dict(), "unet_depth/unet_depth_best.pth")
-                print("[Saved] best model checkpoint.")
+                print("Saved best model checkpoint.")
 
         scheduler.step()
 
@@ -470,8 +516,10 @@ if __name__ == "__main__":
             depths = batch["DEPTH"].to(device)
 
             # forward pass
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                preds = depth_unet(images)
+            #with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            
+            
+            preds = depth_unet(images)
 
             # detach to cpu
             images_np = images.cpu().permute(0,2,3,1).numpy()            # (B,H,W,3)

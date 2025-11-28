@@ -3,6 +3,7 @@
 /unet/
 /*plots*/
 
+/*predictions*/
 *.pth
 *.zip
 

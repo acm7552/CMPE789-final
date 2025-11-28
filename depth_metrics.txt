@@ -1,0 +1,3 @@
+Final Train Loss: 1.8688 | Val Loss: 1.8947
+ MAE: 1.8945 m | RMSE: 16.7060 m | AbsRel: 0.0593
+ delta1: 0.9689 | delta2: 0.9856 | delta3: 0.9907

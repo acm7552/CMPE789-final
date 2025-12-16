@@ -24,27 +24,34 @@ SPEED = 20.0  # km/h
 
 
 
-CAPTURE_INTERVAL = 0.05  # seconds between frames 
-DURATION = 20  # seconds capturing
+CAPTURE_INTERVAL = 0.1  # seconds between frames 
+DURATION = 180  # seconds capturing
 OUTPUT_DIR = "output"
 
 # setup output folders
 
 rgb_dir = os.path.join(OUTPUT_DIR, "rgb")
 seg_dir = os.path.join(OUTPUT_DIR, "seg")
+seg_raw_dir = os.path.join(OUTPUT_DIR, "seg_raw")
 depth_dir = os.path.join(OUTPUT_DIR, "depth")
 
-for d in [rgb_dir, seg_dir, depth_dir]:
+for d in [rgb_dir, seg_dir, seg_raw_dir, depth_dir]:
     os.makedirs(d, exist_ok=True)
 
 
 client = carla.Client(HOST, PORT)
-client.set_timeout(30.0)
+client.set_timeout(120.0)
 world = client.get_world()
+
+settings = world.get_settings()
+settings.synchronous_mode = True
+settings.fixed_delta_seconds = CAPTURE_INTERVAL
+world.apply_settings(settings)
+
 blueprints = world.get_blueprint_library()
 
 # Spawn vehicle
-vehicle_bp = random.choice(blueprints.filter("vehicle.*"))
+vehicle_bp = random.choice(blueprints.filter(VEHICLE_BP_FILTER))
 spawn_point = random.choice(world.get_map().get_spawn_points())
 vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
 
@@ -80,33 +87,84 @@ def make_camera(bp_name):
 
 rgb_cam = make_camera('sensor.camera.rgb')
 seg_cam = make_camera('sensor.camera.semantic_segmentation')
+seg_raw_cam = make_camera('sensor.camera.semantic_segmentation')
 depth_cam = make_camera('sensor.camera.depth')
 
 # thread-safe queues for images
 
 
-rgb_cam.listen(lambda image: image.save_to_disk(os.path.join(rgb_dir, f"{image.frame:06d}.png")))
-seg_cam.listen(lambda image: image.save_to_disk(os.path.join(seg_dir, f"{image.frame:06d}.png"),
-                                               carla.ColorConverter.CityScapesPalette))
-depth_cam.listen(lambda image: image.save_to_disk(os.path.join(depth_dir, f"{image.frame:06d}.png"),
-                                                 carla.ColorConverter.LogarithmicDepth))
 
 
-print(f"Capturing for {DURATION} seconds...")
+# Thread-safe queues
+rgb_q = queue.Queue()
+seg_q = queue.Queue()
+seg_raw_q = queue.Queue()
+depth_q = queue.Queue()
+
+rgb_cam.listen(lambda img: rgb_q.put(img))
+seg_cam.listen(lambda img: seg_q.put(img))
+seg_raw_cam.listen(lambda img: seg_raw_q.put(img))
+depth_cam.listen(lambda img: depth_q.put(img))
+
+print("Capturing synchronized frames...")
+
+frames = int(DURATION / CAPTURE_INTERVAL)
 
 try:
-    time.sleep(DURATION)
+    for _ in range(frames):
+        world.tick()   # <- lockstep tick
+
+        rgb = rgb_q.get()
+        seg = seg_q.get()
+        seg_raw = seg_raw_q.get()
+        depth = depth_q.get()
+
+        frame = rgb.frame
+
+        rgb.save_to_disk(os.path.join(rgb_dir, f"{frame:06d}.png"))
+        seg.save_to_disk(os.path.join(seg_dir, f"{frame:06d}.png"),
+                         carla.ColorConverter.CityScapesPalette)
+        seg_raw.save_to_disk(os.path.join(seg_raw_dir, f"{frame:06d}.png"),
+                         carla.ColorConverter.Raw)
+        depth.save_to_disk(os.path.join(depth_dir, f"{frame:06d}.png"),
+                           carla.ColorConverter.LogarithmicDepth)
 
 finally:
-    print("Stopping and cleaning up...")
     rgb_cam.stop()
     seg_cam.stop()
     depth_cam.stop()
-    rgb_cam.destroy()
-    seg_cam.destroy()
-    depth_cam.destroy()
     vehicle.destroy()
-    print(f"Saved frames to '{OUTPUT_DIR}/'")
+
+    # Restore world settings
+    settings.synchronous_mode = False
+    settings.fixed_delta_seconds = None
+    world.apply_settings(settings)
+
+    print("Done.")
+
+
+# rgb_cam.listen(lambda image: image.save_to_disk(os.path.join(rgb_dir, f"{image.frame:06d}.png")))
+# seg_cam.listen(lambda image: image.save_to_disk(os.path.join(seg_dir, f"{image.frame:06d}.png"),
+#                                                carla.ColorConverter.CityScapesPalette))
+# depth_cam.listen(lambda image: image.save_to_disk(os.path.join(depth_dir, f"{image.frame:06d}.png"),
+#                                                  carla.ColorConverter.LogarithmicDepth))
+
+
+# print(f"Capturing for {DURATION} seconds...")
+
+# try:
+#     time.sleep(DURATION)
+
+# finally:
+#     print("Stopping and cleaning up...")
+#     rgb_cam.stop()
+#     seg_cam.stop()
+#     depth_cam.stop()
+#     rgb_cam.destroy()
+#     seg_cam.destroy()
+#     depth_cam.destroy()
+#     vehicle.destroy()
+#     print(f"Saved frames to '{OUTPUT_DIR}/'")
 
 
 

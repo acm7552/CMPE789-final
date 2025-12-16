@@ -1,5 +1,11 @@
-/output/
+*output*
+*output*/
+/unet/
+/*plots*/
 
+/*predictions*/
+*.pth
+*.zip
 
 
 #### everything below is the default Github python gitignore

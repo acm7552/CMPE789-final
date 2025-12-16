@@ -57,7 +57,12 @@ Some optional arguments:
 
 
 
-## Setup track on Yicheng's device:
+## Run Pipeline
+
+- Make sure the submodule is loaded, and the unet checkpoints are downloaded. 
+- The paths to the checkpoints need to be correctly set in the pipeline.
+
+` python train_CMPE_rulebased.py `
 
 
 

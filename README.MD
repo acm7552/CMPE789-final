@@ -25,16 +25,16 @@
 
 
 ## Data
-
-Expected directory structure:
-    output/
-    └── agent_x/
-        ├── rgb/         # RGB images
-        ├── seg/         # Colorized / processed segmentation (optional)
-        ├── seg_raw/     # CARLA raw segmentation masks
-        ├── depth/       # Processed / visualized depth maps (optional)
-        └── depth_raw/   # CARLA raw depth images
-
+  
+Expected directory structure:  
+    output/  
+    └── agent_x/  
+        ├── rgb/         # RGB images  
+        ├── seg/         # Colorized / processed segmentation (optional)  
+        ├── seg_raw/     # CARLA raw segmentation masks  
+        ├── depth/       # Processed / visualized depth maps (optional)  
+        └── depth_raw/   # CARLA raw depth images  
+  
 ## Run Training
 
 ```python seg_train_UNet_multiVehicle.py output```
